@@ -13,7 +13,20 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 load_dotenv()
 #print(f"DEBUG: Tavily Key found: {os.environ.get('TAVILY_API_KEY') is not None}")
 
-llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash")
+from langchain_core.rate_limiters import InMemoryRateLimiter
+
+# Define a rate limiter (e.g., 2 requests per minute for free tier)
+rate_limiter = InMemoryRateLimiter(
+    requests_per_second=0.033,  # 1 request every 30 seconds
+    check_every_n_seconds=0.1,
+    max_bucket_size=2,
+)
+
+# Attach it to your LLM
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash",
+    rate_limiter=rate_limiter
+)
 memory = InMemorySaver()
 
 #Agent state
@@ -26,47 +39,53 @@ class AgentState(TypedDict):
     user_approval:bool
 
 #MCP config
-node_dir = r"C:\Program Files\nodejs" # Use 'r' for raw string to handle backslashes
-npx_path = os.path.join(node_dir, "npx.cmd")
 brokerage_path = os.path.abspath("brokerage.py")
-
 
 mcp_config = {
     "brokerage": {
-        "command": sys.executable, # Points to the current Python with MCP installed
-        "args": [os.path.abspath("brokerage.py")],
-        "transport": "stdio"
+        "command": sys.executable, 
+        "args": [brokerage_path],
+        "transport": "stdio",
     },
     "researcher_tool": {
-        # We call cmd /c and then provide the full path to npx.cmd
-        "command": "cmd.exe",
-        "args": ["/c", npx_path, "-y", "@tavily/mcp@latest"],
-        "transport": "stdio",
-        "env": os.environ.copy() 
+        # Using Tavily's production remote server URL
+        "command": "npx",
+        "args": [
+            "-y", 
+            "mcp-remote", 
+            f"https://mcp.tavily.com/mcp/?tavilyApiKey={os.environ.get('TAVILY_API_KEY')}"
+        ],
+        "transport": "stdio"
     }
 }
 
 async def researcher_node(state: AgentState):
     ticker = state["ticker"]
-    
     print(f"--- RESEARCHER: Investigating {ticker} ---")
 
-    # 1. Initialize the client without 'async with'
     client = MultiServerMCPClient(mcp_config)
-
-        # 2. Get tools directly
     all_tools = await client.get_tools()
-        
-        # Filter for Tavily (or just use all of them if you prefer)
     search_tools = [t for t in all_tools if "tavily" in t.name.lower()]
-        
-        # 3. Bind to Gemini
+    
+    # 1. Ask Gemini to generate the search query/call the tool
     gemini_with_tools = llm.bind_tools(search_tools)
-        
-    query = f"Latest financial news and analyst sentiment for {ticker} stock."
-    response = await gemini_with_tools.ainvoke(query)
-        
-    return {"research_notes": response.content}
+    query = f"Provide a detailed financial summary and recent news for {ticker} stock."
+    initial_ai_msg = await gemini_with_tools.ainvoke(query)
+
+    # 2. Extract the actual tool output
+    # We manually find the tool and run it to get the raw data for the Advisor
+    research_text = ""
+    if initial_ai_msg.tool_calls:
+        for tool_call in initial_ai_msg.tool_calls:
+            # Match the tool name and execute
+            tool = next(t for t in search_tools if t.name == tool_call["name"])
+            tool_result = await tool.ainvoke(tool_call["args"])
+            research_text += str(tool_result)
+    else:
+        # Fallback if Gemini just answered directly
+        research_text = initial_ai_msg.content
+
+    return {"research_notes": research_text}
     
     # finally:
     #     # 4. CRITICAL: Close the client to kill the background MCP processes
@@ -74,11 +93,17 @@ async def researcher_node(state: AgentState):
 
 async def advisor_node(state: AgentState):
     print(f"--- ADVISOR: Formulating trade strategy ---")
-    # Gemini analyzes the notes and decides
-    prompt = f"Based on: {state['research_notes']}, what trade should we do for {state['ticker']}? Return action and quantity."
+    
+    system_msg = (
+        "You are a professional algorithmic trading bot. "
+        "Analyze the research provided and give a specific verdict. "
+        "Your output MUST include the word 'BUY', 'SELL', or 'HOLD', "
+        "followed by a quantity (e.g., BUY 10 shares)."
+    )
+    
+    prompt = f"{system_msg}\n\nResearch Data: {state['research_notes']}\n\nTicker: {state['ticker']}"
     response = await llm.ainvoke(prompt)
     return {"decision": response.content}
-
 async def execute_trade_node(state: AgentState):
     print(f"--- EXECUTION: Calling MCP Brokerage ---")
     
