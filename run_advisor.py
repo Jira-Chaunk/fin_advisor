@@ -1,5 +1,5 @@
 import asyncio
-from main import app  # Import the 'app' we defined in the previous step
+from main import app  
 
 async def run_loop():
     # 1. Thread ID allows LangGraph to remember the state for this specific user
@@ -7,7 +7,7 @@ async def run_loop():
     
     # 2. Start the process
     # We pass the initial ticker we want to analyze
-    initial_input = {"ticker": "RELIANCE.NS"} 
+    initial_input = {"ticker": "NVDA"} 
     
     print("--- STARTING AGENTIC FLOW ---")
     async for event in app.astream(initial_input, config, stream_mode="values"):
